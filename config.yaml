@@ -1,0 +1,9 @@
+episode: 10000
+gamma: 0.99
+epsilon: 1.0
+epsilon_decay: 0.93
+epsilon_min: 0.01
+learning_rate: 0.0004
+max_memory: 25000
+batch_size: 64          
+target_update_steps: 1000
