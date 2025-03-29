@@ -1,7 +1,7 @@
 import cv2 
 import gym
-from src.model import DiscreteQN
-from src.replay import ReplayBuffer
+from model import DiscreteQN
+from replay import ReplayBuffer
 import random 
 
 import torch 
@@ -17,16 +17,16 @@ class D_environment:
             self.config = yaml.safe_load(f)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
                 
-        self.env = gym.make("LunarLander-v2")
+        self.env = gym.make("LunarLander-v2", render_mode="rgb_array")
         self.model = DiscreteQN(self.env.observation_space.shape[0], self.env.action_space.n).to(self.device)
         self.model_target = DiscreteQN(self.env.observation_space.shape[0], self.env.action_space.n).to(self.device)
         
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.config['lr'])
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.config['learning_rate'])
         self.criterion = nn.MSELoss()
         
-        self.replay_buffer = ReplayBuffer(self.config['buffer_size'])
+        self.replay_buffer = ReplayBuffer(self.config['max_memory'])
         
-        self.target_update_freq = self.config['target_update_freq']
+        self.target_update_freq = self.config['target_update_steps']
         
         self.epsilon = self.config['epsilon']
         self.epsilon_min = self.config['epsilon_min']
@@ -44,7 +44,8 @@ class D_environment:
         avg_grad = [0]
         avg_loss = [0]
         
-        pbar = tqdm(range(self.config["epsiode"]))
+        pbar = tqdm(range(self.config["episode"]))
+        steps = 0
         for episode in pbar: 
             state, _ = self.env.reset()
             total_reward = 0
@@ -74,7 +75,8 @@ class D_environment:
                     loss = self.criterion(targets, current_q_values)
                     self.optimizer.zero_grad() 
                     loss.backward() 
-                    
+                    #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5)
+
                     total_grad = 0.0 
                     for name, param in self.model.named_parameters(): 
                         if param.grad is not None: 
@@ -85,9 +87,11 @@ class D_environment:
                     self.optimizer.step()
                     
                     avg_loss.append(loss.item())
+
+                steps += 1
                     
-            if episode % self.target_update_freq == 0: 
-                self.update_target()
+                if steps % self.target_update_freq == 0: 
+                    self.update_target()
                 
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
             avg_awards.append(total_reward)
