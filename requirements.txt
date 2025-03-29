@@ -1,0 +1,12 @@
+torch
+gym
+numpy==1.23.5
+matplotlib
+pandas
+seaborn
+scikit-learn
+opencv-python
+gym[classic_control]
+tqdm
+optuna
+gym[box2d]
