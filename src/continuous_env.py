@@ -9,6 +9,7 @@ import torch.optim as optim
 import yaml
 import os
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 class C_environment:
     def __init__(self, config_path: str, actor_weights: str = None, critic_weights: str = None):
@@ -32,83 +33,112 @@ class C_environment:
         if critic_weights: 
             self.critic.load(critic_weights)
             
-            
     def train_continuous(self, path: str = None):
-        avg_awards = []
-        avg_loss = [0]
+        avg_rewards = []
+        actor_losses = []
+        critic_losses = []
         
-        pbar = tqdm(range(self.config["episode"]), desc="[Episode]: ")
-        for epsiode in pbar: 
+        pbar = tqdm(range(self.config["episode"]), desc="[Episode]")
+        for episode in pbar:
             state, _ = self.env.reset()
             done = False
-            
-            while not done:  
-                trajectory = {"states": [], 
-                              "actions": [], 
-                              "rewards": [],
-                              "dones": [], 
-                              "log_probs": [], 
-                              "values": []}
-                
-                for _ in range(self.n_step): 
+            episode_reward = 0
+
+            while not done:
+                trajectory = {"states": [],
+                            "actions": [],
+                            "rewards": [],
+                            "dones": [],
+                            "log_probs": [],
+                            "values": []}
+
+                for _ in range(self.n_step):
                     state_tensor = torch.tensor(state).float().to(self.device)
                     mean, std = self.actor(state_tensor)
                     dist = torch.distributions.Normal(mean, std)
                     action = dist.sample()
                     log_prob = dist.log_prob(action).sum(dim=-1)
                     value = self.critic(state_tensor)
-                    
+
                     next_state, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
                     done = terminated or truncated
-                    
+
                     trajectory["states"].append(state_tensor)
                     trajectory["actions"].append(action)
                     trajectory["rewards"].append(torch.tensor(reward, dtype=torch.float32))
                     trajectory["dones"].append(torch.tensor(done, dtype=torch.float32))
                     trajectory["log_probs"].append(log_prob)
                     trajectory["values"].append(value)
-                    
+
                     state = next_state
-                    if done: 
+                    episode_reward += reward
+                    if done:
                         break
-                    
-                if done: 
+
+                if done:
                     next_value = torch.tensor(0.0).to(self.device)
                 else:
                     next_state_tensor = torch.tensor(next_state).float().to(self.device)
                     next_value = self.critic(next_state_tensor).detach()
-                    
-                returns = [] 
-                R = next_value 
+
+                returns = []
+                R = next_value
                 for reward, done_flag in zip(reversed(trajectory["rewards"]), reversed(trajectory["dones"])):
                     R = reward + self.config["gamma"] * R * (1 - done_flag)
                     returns.insert(0, R)
-                    
+
                 returns = torch.stack(returns)
                 values = torch.stack(trajectory["values"])
                 log_probs = torch.stack(trajectory["log_probs"])
-                
+
                 advantages = returns - values.detach()
 
                 critic_loss = ((returns - values) ** 2).mean()
                 self.critic_optim.zero_grad()
                 critic_loss.backward()
                 self.critic_optim.step()
-                
-                actor_loss = -(log_probs * advantages).mean() 
+
+                actor_loss = -(log_probs * advantages).mean()
                 self.actor_optim.zero_grad()
                 actor_loss.backward()
                 self.actor_optim.step()
-                
-                avg_loss.append(actor_loss.item())
-                avg_loss.append(critic_loss.item())
-                avg_awards.append(sum(trajectory["rewards"]).item())
 
-            pbar.postfix = f"Avg Reward: {sum(avg_awards) / len(avg_awards):.4f}, Loss: {sum(avg_loss)/len(avg_loss):.4f}"
-        
-        self.actor.save(os.path.join(path, "c_lander.pth"))
-        self.critic.save(os.path.join(path, "c_critic.pth"))
-            
+                actor_losses.append(actor_loss.item())
+                critic_losses.append(critic_loss.item())
+
+            avg_rewards.append(episode_reward)
+            pbar.set_postfix({
+                "Avg Reward": f"{sum(avg_rewards) / len(avg_rewards):.2f}",
+                "Actor Loss": f"{sum(actor_losses) / len(actor_losses):.4f}",
+                "Critic Loss": f"{sum(critic_losses) / len(critic_losses):.4f}"
+            })
+
+        if path:
+            self.actor.save(os.path.join(path, "c_lander.pth"))
+            self.critic.save(os.path.join(path, "c_critic.pth"))
+            plt.figure(figsize=(12, 5))
+
+            plt.subplot(1, 2, 1)
+            plt.plot(avg_rewards, label="Reward")
+            plt.xlabel("Episode")
+            plt.ylabel("Total Reward")
+            plt.title("Reward per Episode")
+            plt.legend()
+
+            plt.subplot(1, 2, 2)
+            plt.plot(actor_losses, label="Actor Loss", alpha=0.7)
+            plt.plot(critic_losses, label="Critic Loss", alpha=0.7)
+            plt.xlabel("Update Step")
+            plt.ylabel("Loss")
+            plt.title("Actor & Critic Loss")
+            plt.legend()
+
+            plt.tight_layout()
+            plot_path = os.path.join(path, "training_curve.png")
+            plt.savefig(plot_path)
+            plt.close()
+            print(f"Training curve saved to {plot_path}")
+
     def test_dqn(self, path: str):
         self.actor.load(os.path.join(path, "c_lander.pth"))
         
