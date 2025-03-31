@@ -1,7 +1,7 @@
 import cv2 
 import gym
-from src.model import ContinuousQN, Critic
-from src.replay import ReplayBuffer
+import torch.distributions
+from model import ActorContinuous, Critic
 
 import torch 
 import torch.nn as nn 
@@ -9,7 +9,6 @@ import torch.optim as optim
 import yaml
 import os
 from tqdm import tqdm
-import random 
 
 class C_environment:
     def __init__(self, config_path: str, actor_weights: str = None, critic_weights: str = None):
@@ -18,7 +17,7 @@ class C_environment:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"        
         
         self.env = gym.make("LunarLanderContinuous-v2", render_mode="rgb_array")
-        self.actor = ContinuousQN(self.env.observation_space.shape[0], self.env.action_space.shape[0]).to(self.device)
+        self.actor = ActorContinuous(self.env.observation_space.shape[0], self.env.action_space.shape[0]).to(self.device)
         self.critic = Critic(self.env.observation_space.shape[0], self.env.action_space.shape[0]).to(self.device)
         
         self.actor_optim = optim.Adam(self.actor.parameters(), lr=self.config["actor_lr"])
@@ -26,11 +25,7 @@ class C_environment:
         
         self.criterion = nn.MSELoss()
         
-        self.replay_buffer = ReplayBuffer(self.config["max_memory"])
-        
-        self.epsilon = self.config["epsilon"]
-        self.epsilon_min = self.config["epsilon_min"]
-        self.epsilon_decay = self.config["epsilon_decay"]
+        self.n_step = self.config["n_step"]
         
         if actor_weights: 
             self.actor.load(actor_weights)
@@ -40,69 +35,76 @@ class C_environment:
             
     def train_continuous(self, path: str = None):
         avg_awards = []
-        avg_grad = [0]
         avg_loss = [0]
         
-        pbar = tqdm(range(self.config["episode"]))
-        steps = 0
+        pbar = tqdm(range(self.config["episode"]), desc="[Episode]: ")
         for epsiode in pbar: 
             state, _ = self.env.reset()
-            total_reward = 0
             done = False
             
-            while not done: 
-                if random.random() < self.epsilon:
-                    action = self.env.action_space.sample()
-                else: 
-                    with torch.no_grad():
-                        action = self.actor(torch.tensor(state).float().to(self.device))
-                        action = action.squeeze(0).numpy()
+            while not done:  
+                trajectory = {"states": [], 
+                              "actions": [], 
+                              "rewards": [],
+                              "dones": [], 
+                              "log_probs": [], 
+                              "values": []}
                 
-                next_state, reward, terminated, truncated, info = self.env.step(action)
-                done = truncated or terminated
-                self.replay_buffer.add(state, action, reward, next_state, done)
-                state = next_state
-                total_reward += reward
+                for _ in range(self.n_step): 
+                    state_tensor = torch.tensor(state).float().to(self.device)
+                    mean, std = self.actor(state_tensor)
+                    dist = torch.distributions.Normal(mean, std)
+                    action = dist.sample()
+                    log_prob = dist.log_prob(action).sum(dim=-1)
+                    value = self.critic(state_tensor)
+                    
+                    next_state, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
+                    done = terminated or truncated
+                    
+                    trajectory["states"].append(state_tensor)
+                    trajectory["actions"].append(action)
+                    trajectory["rewards"].append(torch.tensor(reward, dtype=torch.float32))
+                    trajectory["dones"].append(torch.tensor(done, dtype=torch.float32))
+                    trajectory["log_probs"].append(log_prob)
+                    trajectory["values"].append(value)
+                    
+                    state = next_state
+                    if done: 
+                        break
+                    
+                if done: 
+                    next_value = torch.tensor(0.0).to(self.device)
+                else:
+                    next_state_tensor = torch.tensor(next_state).float().to(self.device)
+                    next_value = self.critic(next_state_tensor).detach()
+                    
+                returns = [] 
+                R = next_value 
+                for reward, done_flag in zip(reversed(trajectory["rewards"]), reversed(trajectory["dones"])):
+                    R = reward + self.config["gamma"] * R * (1 - done_flag)
+                    returns.insert(0, R)
+                    
+                returns = torch.stack(returns)
+                values = torch.stack(trajectory["values"])
+                log_probs = torch.stack(trajectory["log_probs"])
                 
-                if len(self.replay_buffer) > self.config["batch_size"]:
-                    states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.config["batch_size"])
-                    with torch.no_grad(): 
-                        next_actions = self.actor(states)
-                        target_q = rewards + self.config["gamma"] * self.critic(next_states, next_actions) * (1 - dones)
-                        
-                    current_q = self.critic(states, actions)
-                    critic_loss = self.criterion(current_q, target_q)
-                    
-                    self.critic_optim.zero_grad()
-                    critic_loss.backward()
-                    
-                    grad_norm = 0.0 
-                    for name, param in self.critic.named_parameters(): 
-                        if param.grad is not None: 
-                            grad_norm += param.grad.norm().item() 
-                    
-                    avg_grad.append(grad_norm)
-                    self.critic_optim.step()
-                    avg_loss.append(critic_loss.item())
-                    
-                    actor_actions = self.actor(states)
-                    actor_loss = -self.critic(states, actor_actions).mean()
+                advantages = returns - values.detach()
 
-                    self.actor_optim.zero_grad()
-                    actor_loss.backward()
-                    grad_norm = 0.0
-                    for name, param in self.actor.named_parameters(): 
-                        if param.grad is not None: 
-                            grad_norm += param.grad.norm().item()
-                    avg_grad.append(grad_norm)
-                    self.actor_optim.step()
-                    
-                    avg_loss.append(actor_loss.item())
-                    
-            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-            avg_awards.append(total_reward)
-            
-            pbar.postfix = f"Avg Reward: {sum(avg_awards) / len(avg_awards):.4f}, Epsilon: {self.epsilon:.4f}, Loss: {sum(avg_loss)/len(avg_loss):.4f}, Grad: {sum(avg_grad)/len(avg_grad):.4f}"
+                critic_loss = ((returns - values) ** 2).mean()
+                self.critic_optim.zero_grad()
+                critic_loss.backward()
+                self.critic_optim.step()
+                
+                actor_loss = -(log_probs * advantages).mean() 
+                self.actor_optim.zero_grad()
+                actor_loss.backward()
+                self.actor_optim.step()
+                
+                avg_loss.append(actor_loss.item())
+                avg_loss.append(critic_loss.item())
+                avg_awards.append(sum(trajectory["rewards"]).item())
+
+            pbar.postfix = f"Avg Reward: {sum(avg_awards) / len(avg_awards):.4f}, Loss: {sum(avg_loss)/len(avg_loss):.4f}"
         
         self.actor.save(os.path.join(path, "c_lander.pth"))
         self.critic.save(os.path.join(path, "c_critic.pth"))
@@ -136,9 +138,9 @@ class C_environment:
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             video.write(frame_bgr)
             
-            with torch.no_grad(): 
-                action = self.actor(torch.tensor(state).float().to(self.device))
-                action = action.squeeze(0).cpu().numpy()
+            with torch.no_grad():
+                mean, std = self.actor(torch.tensor(state).float().to(self.device))
+                action = mean.squeeze(0).cpu().numpy()
             
             next_state, reward, terminated, truncated, _ = self.env.step(action)
             done = terminated or truncated
