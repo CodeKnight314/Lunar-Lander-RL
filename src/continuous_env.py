@@ -2,12 +2,14 @@ import cv2
 import gym
 import torch.distributions
 from model import ActorContinuous, Critic
+from replay import ReplayBuffer
 
 import torch 
 import torch.nn as nn 
 import torch.optim as optim
 import yaml
 import os
+import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -18,20 +20,43 @@ class C_environment:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"        
         
         self.env = gym.make("LunarLanderContinuous-v2", render_mode="rgb_array")
-        self.actor = ActorContinuous(self.env.observation_space.shape[0], self.env.action_space.shape[0]).to(self.device)
-        self.critic = Critic(self.env.observation_space.shape[0], self.env.action_space.shape[0]).to(self.device)
+        
+        obs_dim = self.env.observation_space.shape[0]
+        action_dim = self.env.action_space.shape[0]
+        
+        self.actor = ActorContinuous(obs_dim, action_dim).to(self.device)
+        self.critic = Critic(obs_dim + action_dim).to(self.device)
+        
+        self.target_actor = ActorContinuous(obs_dim, action_dim).to(self.device)
+        self.target_critic = Critic(obs_dim + action_dim).to(self.device)
         
         self.actor_optim = optim.Adam(self.actor.parameters(), lr=self.config["actor_lr"])
         self.critic_optim = optim.Adam(self.critic.parameters(), lr=self.config["critic_lr"])
         
-        self.criterion = nn.MSELoss()
+        self.buffer = ReplayBuffer(self.config["max_memory"])
         
-        self.n_step = self.config["n_step"]
+        self.hard_update_target_networks()
+        
+        self.criterion = nn.MSELoss()
         
         if actor_weights: 
             self.actor.load(actor_weights)
         if critic_weights: 
             self.critic.load(critic_weights)
+    
+    def hard_update_target_networks(self):
+        for target_param, param in zip(self.target_actor.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data)
+            
+        for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data)
+    
+    def soft_update_target_networks(self, tau=0.005):
+        for target_param, param in zip(self.target_actor.parameters(), self.actor.parameters()):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+            
+        for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
             
     def train_continuous(self, path: str = None):
         avg_rewards = []
@@ -43,76 +68,69 @@ class C_environment:
             state, _ = self.env.reset()
             done = False
             episode_reward = 0
-
+            
             while not done:
-                trajectory = {"states": [],
-                            "actions": [],
-                            "rewards": [],
-                            "dones": [],
-                            "log_probs": [],
-                            "values": []}
-
-                for _ in range(self.n_step):
-                    state_tensor = torch.tensor(state).float().to(self.device)
-                    mean, std = self.actor(state_tensor)
-                    dist = torch.distributions.Normal(mean, std)
-                    action = dist.sample()
-                    log_prob = dist.log_prob(action).sum(dim=-1)
-                    value = self.critic(state_tensor)
-
-                    next_state, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
-                    done = terminated or truncated
-
-                    trajectory["states"].append(state_tensor)
-                    trajectory["actions"].append(action)
-                    trajectory["rewards"].append(torch.tensor(reward, dtype=torch.float32))
-                    trajectory["dones"].append(torch.tensor(done, dtype=torch.float32))
-                    trajectory["log_probs"].append(log_prob)
-                    trajectory["values"].append(value)
-
-                    state = next_state
-                    episode_reward += reward
-                    if done:
-                        break
-
-                if done:
-                    next_value = torch.tensor(0.0).to(self.device)
+                if len(self.buffer) < self.config["batch_size"]:
+                    action = self.env.action_space.sample()
                 else:
-                    next_state_tensor = torch.tensor(next_state).float().to(self.device)
-                    next_value = self.critic(next_state_tensor).detach()
-
-                returns = []
-                R = next_value
-                for reward, done_flag in zip(reversed(trajectory["rewards"]), reversed(trajectory["dones"])):
-                    R = reward + self.config["gamma"] * R * (1 - done_flag)
-                    returns.insert(0, R)
-
-                returns = torch.stack(returns)
-                values = torch.stack(trajectory["values"])
-                log_probs = torch.stack(trajectory["log_probs"])
-
-                advantages = returns - values.detach()
-
-                critic_loss = ((returns - values) ** 2).mean()
-                self.critic_optim.zero_grad()
-                critic_loss.backward()
-                self.critic_optim.step()
-
-                actor_loss = -(log_probs * advantages).mean()
-                self.actor_optim.zero_grad()
-                actor_loss.backward()
-                self.actor_optim.step()
-
-                actor_losses.append(actor_loss.item())
-                critic_losses.append(critic_loss.item())
-
+                    state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+                    with torch.no_grad():
+                        mean, std = self.actor(state_tensor)
+                        action = torch.clamp(torch.distributions.Normal(mean, std).sample(), -1, 1)
+                        action = action.cpu().numpy().squeeze(0)
+                        
+                    noise = np.random.normal(0, 0.1, size=action.shape)
+                    action = np.clip(action + noise, -1, 1)
+                
+                next_state, reward, terminated, truncated, _ = self.env.step(action)
+                done = terminated or truncated
+                episode_reward += reward
+                
+                self.buffer.add(state, action, reward, next_state, done)
+                state = next_state
+                
+                if len(self.buffer) >= self.config["batch_size"]:
+                    states, actions, rewards, next_states, dones = self.buffer.sample(self.config["batch_size"])
+                    states = states.to(self.device)
+                    actions = actions.to(self.device).float()
+                    rewards = rewards.to(self.device)
+                    next_states = next_states.to(self.device)
+                    dones = dones.to(self.device)
+                    
+                    with torch.no_grad():
+                        next_means, next_stds = self.target_actor(next_states)
+                        next_actions = torch.clamp(torch.distributions.Normal(next_means, next_stds).sample(), -1, 1)
+                        next_q_values = self.target_critic(torch.cat([next_states, next_actions], dim=1))
+                        target_q = rewards + self.config["gamma"] * next_q_values * (1 - dones)
+                    
+                    current_q = self.critic(torch.cat([states, actions], dim=1))
+                    critic_loss = self.criterion(current_q, target_q)
+                    
+                    self.critic_optim.zero_grad()
+                    critic_loss.backward()
+                    self.critic_optim.step()
+                    
+                    means, stds = self.actor(states)
+                    sampled_actions = torch.clamp(torch.distributions.Normal(means, stds).rsample(), -1, 1)
+                    actor_loss = -self.critic(torch.cat([states, sampled_actions], dim=1)).mean()
+                    
+                    self.actor_optim.zero_grad()
+                    actor_loss.backward()
+                    self.actor_optim.step()
+                    
+                    self.soft_update_target_networks()
+                    
+                    actor_losses.append(actor_loss.item())
+                    critic_losses.append(critic_loss.item())
+            
             avg_rewards.append(episode_reward)
+            
             pbar.set_postfix({
-                "Avg Reward": f"{sum(avg_rewards) / len(avg_rewards):.2f}",
-                "Actor Loss": f"{sum(actor_losses) / len(actor_losses):.4f}",
-                "Critic Loss": f"{sum(critic_losses) / len(critic_losses):.4f}"
+                "Running Average Reward": f"{sum(avg_rewards)/len(avg_rewards)}",
+                "Actor Loss": f"{actor_losses[-1] if actor_losses else 0:.4f}",
+                "Critic Loss": f"{critic_losses[-1] if critic_losses else 0:.4f}"
             })
-
+        
         if path:
             self.actor.save(os.path.join(path, "c_lander.pth"))
             self.critic.save(os.path.join(path, "c_critic.pth"))
@@ -134,15 +152,15 @@ class C_environment:
             plt.legend()
 
             plt.tight_layout()
-            plot_path = os.path.join(path, "training_curve.png")
+            plot_path = os.path.join(path, "c_training_curve.png")
             plt.savefig(plot_path)
             plt.close()
             print(f"Training curve saved to {plot_path}")
 
-    def test_dqn(self, path: str):
+    def test_continuous(self, path: str):
         self.actor.load(os.path.join(path, "c_lander.pth"))
         
-        video_path = os.path.join(path, "lander_video.mp4")
+        video_path = os.path.join(path, "c_lander_video.mp4")
         
         state, _ = self.env.reset()
         
@@ -169,7 +187,7 @@ class C_environment:
             video.write(frame_bgr)
             
             with torch.no_grad():
-                mean, std = self.actor(torch.tensor(state).float().to(self.device))
+                mean, _ = self.actor(torch.tensor(state).float().unsqueeze(0).to(self.device))
                 action = mean.squeeze(0).cpu().numpy()
             
             next_state, reward, terminated, truncated, _ = self.env.step(action)
@@ -189,4 +207,3 @@ class C_environment:
         
     def close(self):
         self.env.close()
-                    
