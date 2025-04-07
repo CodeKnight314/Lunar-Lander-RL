@@ -75,7 +75,6 @@ class D_environment:
                     loss = self.criterion(targets, current_q_values)
                     self.optimizer.zero_grad() 
                     loss.backward() 
-                    #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5)
 
                     total_grad = 0.0 
                     for name, param in self.model.named_parameters(): 
