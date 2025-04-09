@@ -63,9 +63,10 @@ class C_environment:
             done = False
             
             while not done: 
-                action = self.actor.sample(torch.tensor(state).float().to(self.device))
-                next_state, reward, terminated, truncated, info = self.env.step(action)
-                self.buffer.add(state, action, reward, next_state, done)
+                action, log_prob = self.actor.sample(torch.tensor(state).float().to(self.device))
+                next_state, reward, terminated, truncated, info = self.env.step(action.cpu().detach().numpy())
+                done = terminated or truncated
+                self.buffer.add(state, action.cpu().detach(), reward, next_state, done)
                 state = next_state 
                 total_reward += reward
                 
@@ -142,7 +143,7 @@ class C_environment:
             with torch.no_grad(): 
                 action, _ = self.actor.sample(state)
                 
-            next_state, reward, terminated, truncated, _ = self.env.step(action)
+            next_state, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
             doen = terminated or truncated 
             
             state = next_state 
