@@ -35,137 +35,90 @@ class C_environment:
         
         self.buffer = ReplayBuffer(self.config["max_memory"])
         
-        self.hard_update_target_networks()
-        
         self.criterion = nn.MSELoss()
+        
+        self.target_update_freq = self.config['target_update_steps']
         
         if actor_weights: 
             self.actor.load(actor_weights)
         if critic_weights: 
             self.critic.load(critic_weights)
     
-    def hard_update_target_networks(self):
-        for target_param, param in zip(self.target_actor.parameters(), self.actor.parameters()):
-            target_param.data.copy_(param.data)
-            
-        for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
-            target_param.data.copy_(param.data)
-    
-    def soft_update_target_networks(self, tau=0.005):
-        for target_param, param in zip(self.target_actor.parameters(), self.actor.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-            
-        for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-            
-    def train_continuous(self, path: str = None):
-        avg_rewards = []
-        actor_losses = []
-        critic_losses = []
+    def update_target_network(self): 
+        self.target_actor.load_state_dict(self.actor.state_dict())
+        self.target_critic.load_state_dict(self.critic.state_dict())
         
-        pbar = tqdm(range(self.config["episode"]), desc="[Episode]")
-        for episode in pbar:
-            state, _ = self.env.reset()
+    def train_continuous(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        
+        avg_reward = [] 
+        avg_actor_loss = []
+        avg_critic_loss = []
+        
+        pbar = tqdm(range(self.config["episode"]))
+        steps = 0
+        for episode in pbar: 
+            state, _ = self.env.reset() 
+            total_reward = 0
             done = False
-            episode_reward = 0
             
-            while not done:
-                if len(self.buffer) < self.config["batch_size"]:
-                    action = self.env.action_space.sample()
-                else:
-                    state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
-                    with torch.no_grad():
-                        mean, std = self.actor(state_tensor)
-                        action = torch.clamp(torch.distributions.Normal(mean, std).sample(), -1, 1)
-                        action = action.cpu().numpy().squeeze(0)
-                        
-                    noise = np.random.normal(0, 0.1, size=action.shape)
-                    action = np.clip(action + noise, -1, 1)
-                
-                next_state, reward, terminated, truncated, _ = self.env.step(action)
-                done = terminated or truncated
-                episode_reward += reward
-                
+            while not done: 
+                action = self.actor.sample(torch.tensor(state).float().to(self.device))
+                next_state, reward, terminated, truncated, info = self.env.step(action)
                 self.buffer.add(state, action, reward, next_state, done)
-                state = next_state
+                state = next_state 
+                total_reward += reward
                 
-                if len(self.buffer) >= self.config["batch_size"]:
+                if len(self.buffer) > self.config["batch_size"]:
                     states, actions, rewards, next_states, dones = self.buffer.sample(self.config["batch_size"])
-                    states = states.to(self.device)
-                    actions = actions.to(self.device).float()
-                    rewards = rewards.to(self.device)
-                    next_states = next_states.to(self.device)
-                    dones = dones.to(self.device)
                     
-                    with torch.no_grad():
-                        next_means, next_stds = self.target_actor(next_states)
-                        next_actions = torch.clamp(torch.distributions.Normal(next_means, next_stds).sample(), -1, 1)
-                        next_q_values = self.target_critic(torch.cat([next_states, next_actions], dim=1))
-                        target_q = rewards + self.config["gamma"] * next_q_values * (1 - dones)
-                    
-                    current_q = self.critic(torch.cat([states, actions], dim=1))
-                    critic_loss = self.criterion(current_q, target_q)
+                    with torch.no_grad(): 
+                        next_actions, _ = self.target_actor.sample(states)
+                        q_target_next = self.target_critic(torch.cat([next_states, next_actions], dim=1))
+                        q_target = rewards + self.config["gamma"] * (1 - dones) * q_target_next
+                        
+                    q_pred = self.critic(torch.cat([states, actions], dim=1))
+                    critic_loss = self.criterion(q_pred, q_target)
                     
                     self.critic_optim.zero_grad()
                     critic_loss.backward()
                     self.critic_optim.step()
                     
-                    means, stds = self.actor(states)
-                    sampled_actions = torch.clamp(torch.distributions.Normal(means, stds).rsample(), -1, 1)
-                    actor_loss = -self.critic(torch.cat([states, sampled_actions], dim=1)).mean()
-                    
+                    curr_actions, _ = self.actor.sample(states)
+                    actor_loss = -self.critic(torch.cat([states, curr_actions], dim=1)).mean()
+
                     self.actor_optim.zero_grad()
                     actor_loss.backward()
                     self.actor_optim.step()
                     
-                    self.soft_update_target_networks()
-                    
-                    actor_losses.append(actor_loss.item())
-                    critic_losses.append(critic_loss.item())
-            
-            avg_rewards.append(episode_reward)
-            
+                    avg_actor_loss.append(actor_loss.item())
+                    avg_critic_loss.append(critic_loss.item())
+
+                steps += 1
+                if steps % self.target_update_freq == 0:
+                    self.update_target_network()
+
+            avg_reward.append(total_reward)
+
             pbar.set_postfix({
-                "Running Average Reward": f"{sum(avg_rewards)/len(avg_rewards)}",
-                "Actor Loss": f"{actor_losses[-1] if actor_losses else 0:.4f}",
-                "Critic Loss": f"{critic_losses[-1] if critic_losses else 0:.4f}"
+                "Avg Reward": np.mean(avg_reward) if len(avg_reward) > 0 else 0,
+                "Actor Loss": np.mean(avg_actor_loss) if len(avg_critic_loss) > 0 else 0,
+                "Critic Loss": np.mean(avg_critic_loss) if len(avg_critic_loss) > 0 else 0
             })
-        
-        if path:
-            self.actor.save(os.path.join(path, "c_lander.pth"))
-            self.critic.save(os.path.join(path, "c_critic.pth"))
-            plt.figure(figsize=(12, 5))
-
-            plt.subplot(1, 2, 1)
-            plt.plot(avg_rewards, label="Reward")
-            plt.xlabel("Episode")
-            plt.ylabel("Total Reward")
-            plt.title("Reward per Episode")
-            plt.legend()
-
-            plt.subplot(1, 2, 2)
-            plt.plot(actor_losses, label="Actor Loss", alpha=0.7)
-            plt.plot(critic_losses, label="Critic Loss", alpha=0.7)
-            plt.xlabel("Update Step")
-            plt.ylabel("Loss")
-            plt.title("Actor & Critic Loss")
-            plt.legend()
-
-            plt.tight_layout()
-            plot_path = os.path.join(path, "c_training_curve.png")
-            plt.savefig(plot_path)
-            plt.close()
-            print(f"Training curve saved to {plot_path}")
-
+            
+        self.critic.save(os.path.join(path, "c_critic.pth"))
+        self.actor.save(os.path.join(path, "c_actor.pth"))
+    
     def test_continuous(self, path: str):
-        self.actor.load(os.path.join(path, "c_lander.pth"))
-        
-        video_path = os.path.join(path, "c_lander_video.mp4")
+        os.makedirs(path, exist_ok=True)
+
+        self.actor.load(os.path.join(path, "c_actor.pth"))
+        video_path = os.path.join(path, "lander_video.mp4")
         
         state, _ = self.env.reset()
         
         total_reward = 0
-        done = False
+        done = False 
         
         frame = self.env.render()
         height, width, layers = frame.shape
@@ -176,34 +129,33 @@ class C_environment:
         frames = []
         
         total_reward = 0
-        done = False
+        done = False 
         step_count = 0
         
-        while not done:
-            frame = self.env.render()
+        while not done: 
+            frame = self.env.render() 
             frames.append(frame)
             
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             video.write(frame_bgr)
             
-            with torch.no_grad():
-                mean, _ = self.actor(torch.tensor(state).float().unsqueeze(0).to(self.device))
-                action = mean.squeeze(0).cpu().numpy()
-            
+            with torch.no_grad(): 
+                action, _ = self.actor.sample(state)
+                
             next_state, reward, terminated, truncated, _ = self.env.step(action)
-            done = terminated or truncated
+            doen = terminated or truncated 
             
-            state = next_state
-            total_reward += reward
-            step_count += 1
+            state = next_state 
+            total_reward += reward 
+            step_coiunt += 1 
             
-            if step_count % 20 == 0:
+            if step_count % 20 == 0: 
                 print(f"Recording step {step_count}, current reward: {total_reward}")
-        
+                
         video.release()
         print(f"MP4 video saved to {video_path}")
         print(f"Test completed with total reward: {total_reward}")
         return total_reward
-        
-    def close(self):
+    
+    def close(self): 
         self.env.close()
