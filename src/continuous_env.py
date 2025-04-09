@@ -1,6 +1,5 @@
 import cv2 
 import gym
-import torch.distributions
 from model import ActorContinuous, Critic
 from replay import ReplayBuffer
 
@@ -11,7 +10,6 @@ import yaml
 import os
 import numpy as np
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 class C_environment:
     def __init__(self, config_path: str, actor_weights: str = None, critic_weights: str = None):
@@ -36,17 +34,28 @@ class C_environment:
         self.buffer = ReplayBuffer(self.config["max_memory"])
         
         self.criterion = nn.MSELoss()
-        
-        self.target_update_freq = self.config['target_update_steps']
+
+        self.tau = self.config.get("tau", 0.005)
+        self.target_update_freq = self.config.get('target_update_steps', 1)
+
+        self.max_grad_norm = self.config.get("max_grad_norm", 0.5)
         
         if actor_weights: 
             self.actor.load(actor_weights)
         if critic_weights: 
             self.critic.load(critic_weights)
+
+        self.update_target_network(hard_update=True)
     
-    def update_target_network(self): 
-        self.target_actor.load_state_dict(self.actor.state_dict())
-        self.target_critic.load_state_dict(self.critic.state_dict())
+    def update_target_network(self, hard_update=False): 
+        if hard_update:
+            self.target_actor.load_state_dict(self.actor.state_dict())
+            self.target_critic.load_state_dict(self.critic.state_dict())
+        else:
+            for target_param, param in zip(self.target_actor.parameters(), self.actor.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+            for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
         
     def train_continuous(self, path: str):
         os.makedirs(path, exist_ok=True)
@@ -66,6 +75,7 @@ class C_environment:
                 action, log_prob = self.actor.sample(torch.tensor(state).float().to(self.device))
                 next_state, reward, terminated, truncated, info = self.env.step(action.cpu().detach().numpy())
                 done = terminated or truncated
+
                 self.buffer.add(state, action.cpu().detach(), reward, next_state, done)
                 state = next_state 
                 total_reward += reward
@@ -74,15 +84,18 @@ class C_environment:
                     states, actions, rewards, next_states, dones = self.buffer.sample(self.config["batch_size"])
                     
                     with torch.no_grad(): 
-                        next_actions, _ = self.target_actor.sample(states)
+                        next_actions, _ = self.target_actor.sample(next_states)
+                        noise = (torch.randn_like(next_actions) * self.config.get("policy_noise", 0.2)).clamp(-self.config.get("noise_clip", 0.5), self.config.get("noise_clip", 0.5))
+                        next_actions = (next_actions + noise).clamp(self.config.get("min_action", -1.0), self.config.get("max_action", 1.0))
                         q_target_next = self.target_critic(torch.cat([next_states, next_actions], dim=1))
                         q_target = rewards + self.config["gamma"] * (1 - dones) * q_target_next
-                        
+
                     q_pred = self.critic(torch.cat([states, actions], dim=1))
                     critic_loss = self.criterion(q_pred, q_target)
                     
                     self.critic_optim.zero_grad()
                     critic_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                     self.critic_optim.step()
                     
                     curr_actions, _ = self.actor.sample(states)
@@ -90,6 +103,7 @@ class C_environment:
 
                     self.actor_optim.zero_grad()
                     actor_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                     self.actor_optim.step()
                     
                     avg_actor_loss.append(actor_loss.item())
@@ -102,9 +116,9 @@ class C_environment:
             avg_reward.append(total_reward)
 
             pbar.set_postfix({
-                "Avg Reward": np.mean(avg_reward) if len(avg_reward) > 0 else 0,
-                "Actor Loss": np.mean(avg_actor_loss) if len(avg_critic_loss) > 0 else 0,
-                "Critic Loss": np.mean(avg_critic_loss) if len(avg_critic_loss) > 0 else 0
+                "Avg Reward": np.mean(avg_reward) if avg_reward else 0,
+                "Actor Loss": np.mean(avg_actor_loss) if avg_actor_loss else 0,
+                "Critic Loss": np.mean(avg_critic_loss) if avg_critic_loss else 0
             })
             
         self.critic.save(os.path.join(path, "c_critic.pth"))
@@ -141,14 +155,14 @@ class C_environment:
             video.write(frame_bgr)
             
             with torch.no_grad(): 
-                action, _ = self.actor.sample(state)
+                action, _ = self.actor.sample(torch.tensor(state).float().to(self.device))
                 
             next_state, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
-            doen = terminated or truncated 
+            done = terminated or truncated 
             
             state = next_state 
             total_reward += reward 
-            step_coiunt += 1 
+            step_count += 1 
             
             if step_count % 20 == 0: 
                 print(f"Recording step {step_count}, current reward: {total_reward}")
