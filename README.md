@@ -4,13 +4,17 @@ This is an exercise using Actor-Critic and Deep Q Networks for OpenAI's gym envi
 For continuous RL models (Actor/Critic), the Actor model outputs a Gaussian Normal Distribution of the action space based on the given state. The Critic model is defined as a Q-Value function that outputs a scalar score based on the given state and action pair. Noise injection is added to the action outputs to enable additional exploration capabilities. Using Actor/Critic, with proper hyperparameters, convergences was accomplished in 1/4 the episodes for discrete Q-Networks in discrete action space.
 
 ## Results
-Continuous Action space (left) and Discrete Action space (Right) results from testing. I'm not sure if there was training errors for discrete but continuous clearly lands smoother on terrain despite less episodes for training.
-<div style="display: flex; flex-direction: column; align-items: center; gap: 20px; max-width: 90%; margin: 0 auto;">
-    <img src="src/resources/c_lander_video.gif" alt="Continuous Action space" style="width: 90%; max-width: 800px; margin: 10px 0;">
-    <img src="src/resources/d_lander_video.gif" alt="Discrete Action space" style="width: 90%; max-width: 800px; margin: 10px 0;">
+Continuous Action space (Top) and Discrete Action space (Bottom) results from testing. I'm not sure if there was training errors for discrete but continuous clearly lands smoother on terrain despite less episodes for training.
+<div style="display: flex; flex-direction: column; align-items: center; gap: 20px; max-width: 100%; margin: 0 auto;">
+    <div style="text-align: center;">
+        <p><strong>Continuous Action Space</strong></p>
+        <img src="src/resources/c_lander_video.gif" alt="Continuous Action space" style="width: 90%; max-width: 800px;">
+    </div>
+    <div style="text-align: center;">
+        <p><strong>Discrete Action Space</strong></p>
+        <img src="src/resources/d_lander_video.gif" alt="Discrete Action space" style="width: 90%; max-width: 800px;">
+    </div>
 </div>
-
-
 
 ## Installation
 1. Git clone the repository 
