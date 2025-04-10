@@ -6,11 +6,10 @@ For continuous RL models (Actor/Critic), the Actor model outputs a Gaussian Norm
 ## Results
 Continuous Action space (left) and Discrete Action space (Right) results from testing. I'm not sure if there was training errors for discrete but continuous clearly lands smoother on terrain despite less episodes for training.
 <div style="display: flex; justify-content: center; flex-wrap: wrap; gap: 20px; max-width: 90%; margin: 0 auto;">
-    <div style="display: flex; justify-content: center; flex-basis: 100%; flex-wrap: wrap;">
-        <img src="src/resources/c_lander_video.gif" alt="Continuous Action space" style="width: 50%; margin: 10px;">
-        <img src="src/resources/d_lander_video.gif" alt="Discrete Action space" style="width: 50%; margin: 10px;">
-    </div>
+    <img src="src/resources/c_lander_video.gif" alt="Continuous Action space" style="width: 45%; margin: 10px;">
+    <img src="src/resources/d_lander_video.gif" alt="Discrete Action space" style="width: 45%; margin: 10px;">
 </div>
+
 
 ## Installation
 1. Git clone the repository 
